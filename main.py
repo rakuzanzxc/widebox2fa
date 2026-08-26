@@ -71,6 +71,13 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_login_uuid ON login_sessions(minecraft_uuid);
     CREATE INDEX IF NOT EXISTS idx_link_uuid ON link_tokens(minecraft_uuid);
     """)
+    # Migration for installations created before account blocking existed.
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(linked_accounts)").fetchall()}
+    if "blocked" not in columns:
+        db.execute("ALTER TABLE linked_accounts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(linked_accounts)").fetchall()}
+    if "twofa_enabled" not in columns:
+        db.execute("ALTER TABLE linked_accounts ADD COLUMN twofa_enabled INTEGER NOT NULL DEFAULT 1")
     db.commit()
 
 def now() -> int:
@@ -206,21 +213,152 @@ async def start_link_flow(message: dict, token: str):
 
     await finish_link(token, user, chat_id)
 
+async def account_status_message(user_id: int):
+    row = db.execute(
+        """SELECT minecraft_uuid, minecraft_name, linked_at, blocked, twofa_enabled
+           FROM linked_accounts WHERE telegram_id=?""",
+        (user_id,)
+    ).fetchone()
+
+    if not row:
+        return (
+            "🔐 <b>WIDEBOX 2FA</b>\n\n"
+            "❌ К этому Telegram не привязан Minecraft-аккаунт.",
+            None
+        )
+
+    blocked = bool(row["blocked"])
+    twofa_enabled = bool(row["twofa_enabled"])
+
+    state = "🔴 Заблокирован" if blocked else "🟢 Разблокирован"
+    twofa_state = "🟢 Включена" if twofa_enabled else "⚪ Выключена"
+
+    block_button = (
+        {"text": "🔓 Разблокировать аккаунт", "callback_data": "account:toggle"}
+        if blocked else
+        {"text": "🔒 Заблокировать аккаунт", "callback_data": "account:toggle"}
+    )
+    twofa_button = (
+        {"text": "🔐 Двухфакторная проверка: ВКЛ", "callback_data": "twofa:toggle"}
+        if twofa_enabled else
+        {"text": "🔐 Двухфакторная проверка: ВЫКЛ", "callback_data": "twofa:toggle"}
+    )
+
+    text = (
+        "🔐 <b>WIDEBOX 2FA</b>\n\n"
+        f"Игрок: <code>{html.escape(row['minecraft_name'])}</code>\n"
+        "Привязка: ✅ Активна\n"
+        f"Аккаунт: {state}\n"
+        f"Двухфакторная проверка: {twofa_state}"
+    )
+    return text, [[twofa_button], [block_button]]
+
+async def show_account_status(chat_id: int, user_id: int):
+    text, keyboard = await account_status_message(user_id)
+    await send(chat_id, text, keyboard)
+
 async def handle_message(message: dict):
-    text = message.get("text", "")
-    if not text.startswith("/start"):
+    text = message.get("text", "").strip()
+    chat_id = message["chat"]["id"]
+    user_id = int(message["from"]["id"])
+
+    if text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            await send(chat_id, "Используй ссылку, которую сервер выдаёт командой /2fa.")
+            return
+        await start_link_flow(message, parts[1].strip())
         return
-    parts = text.split(maxsplit=1)
-    if len(parts) != 2:
-        await send(message["chat"]["id"], "Используй ссылку, которую сервер выдаёт командой /2fa.")
+
+    # Telegram accepts this as command /2fa with argument "status".
+    # Also support /2fa_status for convenience.
+    normalized = text.split("@", 1)[0] if text.startswith("/2fa@") else text
+    if normalized == "/2fa status" or normalized == "/2fa_status":
+        await show_account_status(chat_id, user_id)
         return
-    await start_link_flow(message, parts[1].strip())
+
+    if text == "/2fa":
+        await send(
+            chat_id,
+            "🔐 <b>WIDEBOX 2FA</b>\n\n"
+            "Доступно:\n"
+            "<code>/2fa status</code> — статус и блокировка аккаунта."
+        )
+        return
 
 async def handle_callback(cb: dict):
     data = cb.get("data", "")
     user = cb["from"]
     chat_id = cb["message"]["chat"]["id"]
     callback_id = cb["id"]
+
+    if data == "twofa:toggle":
+        row = db.execute(
+            "SELECT minecraft_uuid, minecraft_name, twofa_enabled FROM linked_accounts WHERE telegram_id=?",
+            (int(user["id"]),)
+        ).fetchone()
+        if not row:
+            await answer_callback(callback_id, "Minecraft-аккаунт не привязан.", True)
+            return
+
+        new_enabled = 0 if bool(row["twofa_enabled"]) else 1
+        db.execute(
+            "UPDATE linked_accounts SET twofa_enabled=? WHERE telegram_id=?",
+            (new_enabled, int(user["id"]))
+        )
+        db.commit()
+
+        await answer_callback(
+            callback_id,
+            "Двухфакторная проверка включена." if new_enabled else "Двухфакторная проверка выключена."
+        )
+
+        text, keyboard = await account_status_message(int(user["id"]))
+        try:
+            await tg("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": cb["message"]["message_id"],
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": keyboard}
+            })
+        except Exception:
+            await send(chat_id, text, keyboard)
+        return
+
+    if data == "account:toggle":
+        row = db.execute(
+            "SELECT minecraft_uuid, minecraft_name, blocked FROM linked_accounts WHERE telegram_id=?",
+            (int(user["id"]),)
+        ).fetchone()
+        if not row:
+            await answer_callback(callback_id, "Minecraft-аккаунт не привязан.", True)
+            return
+
+        new_blocked = 0 if bool(row["blocked"]) else 1
+        db.execute(
+            "UPDATE linked_accounts SET blocked=? WHERE telegram_id=?",
+            (new_blocked, int(user["id"]))
+        )
+        db.commit()
+
+        await answer_callback(
+            callback_id,
+            "Аккаунт разблокирован." if new_blocked == 0 else "Аккаунт заблокирован."
+        )
+
+        text, keyboard = await account_status_message(int(user["id"]))
+        try:
+            await tg("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": cb["message"]["message_id"],
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": keyboard}
+            })
+        except Exception:
+            await send(chat_id, text, keyboard)
+        return
 
     if data.startswith("sub:"):
         token = data[4:]
@@ -389,7 +527,7 @@ async def health():
 async def account(minecraft_uuid: str, x_api_key: Optional[str] = Header(None)):
     auth(x_api_key)
     row = db.execute(
-        "SELECT minecraft_name, telegram_username, linked_at FROM linked_accounts WHERE minecraft_uuid=?",
+        "SELECT minecraft_name, telegram_username, linked_at, blocked, twofa_enabled FROM linked_accounts WHERE minecraft_uuid=?",
         (minecraft_uuid,)
     ).fetchone()
     if not row:
@@ -398,7 +536,9 @@ async def account(minecraft_uuid: str, x_api_key: Optional[str] = Header(None)):
         "linked": True,
         "minecraft_name": row["minecraft_name"],
         "telegram_username": row["telegram_username"],
-        "linked_at": row["linked_at"]
+        "linked_at": row["linked_at"],
+        "blocked": bool(row["blocked"]),
+        "twofa_enabled": bool(row["twofa_enabled"])
     }
 
 @app.post("/v1/link/request")
